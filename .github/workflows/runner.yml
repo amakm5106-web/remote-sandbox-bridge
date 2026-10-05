@@ -1,0 +1,150 @@
+name: Remote sandbox runner
+
+run-name: "${{ inputs.task_type }} / ${{ inputs.request_id }}"
+
+on:
+  workflow_dispatch:
+    inputs:
+      task_type:
+        description: "Workload type"
+        required: true
+        type: choice
+        options:
+          - execute_script
+          - build_apk
+      payload:
+        description: "Script text, or HTTPS Git repository/ZIP URL"
+        required: true
+        type: string
+      language:
+        description: "Script language; ignored for build_apk"
+        required: true
+        type: choice
+        options:
+          - python
+          - bash
+      request_id:
+        description: "Bridge correlation ID"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: remote-sandbox-${{ inputs.request_id }}
+  cancel-in-progress: false
+
+env:
+  DEBIAN_FRONTEND: noninteractive
+  GRADLE_OPTS: -Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g
+
+jobs:
+  run:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout runner repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        if: inputs.task_type == 'build_apk'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Set up Android SDK
+        if: inputs.task_type == 'build_apk'
+        uses: android-actions/setup-android@v3
+
+      - name: Install common tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends curl unzip ca-certificates
+
+      - name: Execute Python or Bash payload
+        if: inputs.task_type == 'execute_script'
+        env:
+          PAYLOAD: ${{ inputs.payload }}
+          LANGUAGE: ${{ inputs.language }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          mkdir -p output
+          printf '%s' "$PAYLOAD" > payload.txt
+          case "$LANGUAGE" in
+            python)
+              python payload.txt 2>&1 | tee output/console.log
+              ;;
+            bash)
+              bash payload.txt 2>&1 | tee output/console.log
+              ;;
+            *)
+              echo "Unsupported language: $LANGUAGE" | tee output/console.log
+              exit 2
+              ;;
+          esac
+
+      - name: Download Android source
+        if: inputs.task_type == 'build_apk'
+        env:
+          SOURCE_URL: ${{ inputs.payload }}
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          umask 077
+          mkdir -p output source
+          case "$SOURCE_URL" in
+            https://*.git|https://github.com/*|https://gitlab.com/*|https://bitbucket.org/*)
+              git clone --depth 1 -- "$SOURCE_URL" source/project
+              ;;
+            https://*)
+              curl --fail --location --proto '=https' --tlsv1.2 --max-filesize 52428800 \
+                --output source/project.zip "$SOURCE_URL"
+              unzip -q source/project.zip -d source/unpacked
+              first_dir=$(find source/unpacked -mindepth 1 -maxdepth 1 -type d -print -quit || true)
+              if [[ -n "$first_dir" ]]; then mv "$first_dir" source/project; else mv source/unpacked source/project; fi
+              ;;
+            *)
+              echo "Only HTTPS Git or ZIP URLs are accepted" | tee output/console.log
+              exit 2
+              ;;
+          esac
+          printf 'Source prepared at %s\n' "$PWD/source/project" | tee output/console.log
+
+      - name: Build Android APK
+        if: inputs.task_type == 'build_apk'
+        working-directory: source/project
+        shell: bash
+        run: |
+          set -Eeuo pipefail
+          if [[ -x ./gradlew ]]; then
+            ./gradlew --no-daemon --stacktrace assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/output/console.log"
+          elif [[ -f ./build.gradle || -f ./build.gradle.kts ]]; then
+            gradle --no-daemon --stacktrace assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/output/console.log"
+          else
+            echo "No Gradle wrapper or root build.gradle/build.gradle.kts found" | tee "$GITHUB_WORKSPACE/output/console.log"
+            exit 2
+          fi
+          find . -type f -path '*/build/outputs/apk/*.apk' -print -exec cp {} "$GITHUB_WORKSPACE/output/" \;
+          compgen -G "$GITHUB_WORKSPACE/output/*.apk" > /dev/null || {
+            echo "Build completed but no APK was found" | tee -a "$GITHUB_WORKSPACE/output/console.log"
+            exit 3
+          }
+
+      - name: Upload logs and APKs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: remote-sandbox-${{ inputs.request_id }}
+          path: output/
+          if-no-files-found: warn
+          retention-days: 7
